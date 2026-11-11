@@ -5,7 +5,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Vencord userplugin](https://img.shields.io/badge/Vencord-userplugin-5865F2.svg)](https://docs.vencord.dev/installing/custom-plugins/)
 [![Equicord compatible](https://img.shields.io/badge/Equicord-compatible-a6d189.svg)](https://github.com/Equicord/Equicord)
-[![GitHub stars](https://img.shields.io/github/stars/elioflex/fakeMessage?style=flat)](https://github.com/elioflex/fakeMessage/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/hoodratleahh/fakeMessage?style=flat)](https://github.com/hoodratleahh/fakeMessage/stargazers)
 
 FakeMessage is a [Vencord](https://github.com/Vendicated/Vencord) / [Equicord](https://github.com/Equicord/Equicord) plugin that puts a message into any channel **as if another user had sent it**, with their real avatar, username, role color and timestamp. The message never leaves your client. Discord's own message component renders it, so it looks and behaves exactly like a real one.
 
@@ -14,7 +14,7 @@ FakeMessage is a [Vencord](https://github.com/Vendicated/Vencord) / [Equicord](h
 **Quick install** (needs a Vencord or Equicord source build):
 
 ```bash
-git clone https://github.com/elioflex/fakeMessage && cp -R fakeMessage/FakeMessage Vencord/src/userplugins/
+git clone https://github.com/hoodratleahh/fakeMessage && cp -R fakeMessage/FakeMessage Vencord/src/userplugins/
 ```
 
 Then run `pnpm build`, restart Discord, and enable **FakeMessage**. Full steps are under [Install](#install).
