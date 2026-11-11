@@ -818,8 +818,9 @@ type AuthorRemap = Record<string, { authorId: string; author: Record<string, any
  * show someone else's imported messages as a user you choose (and, since the
  * replacement is a real resolved user, it also sidesteps uncached-author issues).
  */
-function importDataCode(channelId: string, text: string, remap?: AuthorRemap): ParsedDataCode {
+function importDataCode(channelId: string, text: string, remap?: AuthorRemap, shiftMs = 0): ParsedDataCode {
     const parsed = parseDataCode(text);
+    if (shiftMs) for (const m of parsed.messages) m.timestamp += shiftMs;
 
     // Re-importing a chat replaces the previous import into this channel instead
     // of stacking a duplicate copy on top of it (messages made by hand are kept).
@@ -896,6 +897,13 @@ function exportDataCode(channelId: string): { code: string; count: number; } {
 
     const code = JSON.stringify({ format: DATA_FORMAT, version: 1, name: chatName(channelId), messages }, null, 2);
     return { code, count: messages.length };
+}
+
+/** A millisecond time as a value for an <input type="datetime-local">, in local time. */
+function toLocalInput(ms: number): string {
+    const d = new Date(ms);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 async function readClipboard(): Promise<string> {
@@ -981,6 +989,7 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
     const [code, setCode] = React.useState("");
     const [remap, setRemap] = React.useState<Record<string, string>>({});
     const [importing, setImporting] = React.useState(false);
+    const [startAt, setStartAt] = React.useState("");
 
     // What the pasted data code holds, or why it can't be used.
     const parsed = React.useMemo(() => {
@@ -991,6 +1000,12 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
             return { ok: false as const, error: (e as Error).message };
         }
     }, [code]);
+
+    // Pre-fill the start-time field with the pasted chat's own first time.
+    const originalStart = parsed?.ok ? parsed.messages[0].timestamp : null;
+    React.useEffect(() => {
+        setStartAt(originalStart == null ? "" : toLocalInput(originalStart));
+    }, [originalStart]);
 
     // The distinct authors in the pasted code, each of which can be replaced.
     const importAuthors = React.useMemo(() => {
@@ -1035,6 +1050,14 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
             if (importing) return;
             setImporting(true);
             try {
+                // Shift the whole chat so its first message lands on the chosen time;
+                // the gaps between messages stay exactly as they were.
+                let shiftMs = 0;
+                if (startAt && parsed?.ok) {
+                    const want = new Date(startAt).getTime();
+                    if (!Number.isFinite(want)) throw new Error("That start time isn't valid.");
+                    shiftMs = want - parsed.messages[0].timestamp;
+                }
                 // Load EVERY author through Discord so each fake message is attributed
                 // to a real, cached User — the same kind of object a normal fake message
                 // uses. A replacement ID (if typed) is loaded instead of the original.
@@ -1050,8 +1073,9 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                     else failed++; // couldn't load this one; it keeps its saved snapshot
                 }
                 const replaced = importAuthors.filter(a => (remap[a.id] || "").trim()).length;
-                const result = importDataCode(channelId, code, resolved);
+                const result = importDataCode(channelId, code, resolved, shiftMs);
                 const notes = [
+                    shiftMs ? "retimed" : "",
                     replaced ? `${replaced} replaced` : "",
                     failed ? `${failed} user(s) couldn't be loaded` : ""
                 ].filter(Boolean).join(" · ");
@@ -1128,7 +1152,7 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
             {mode === "import" ? (
                 <div>
                     <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px" }}>
-                        Paste a chat's data code. Each person is loaded as a real user and their messages are added here with their original times. Re-importing replaces the last import. Replace anyone below.
+                        Paste a chat's data code. Each person is loaded as a real user and their messages are added here — at their original times, or retimed below. Re-importing replaces the last import.
                     </div>
                     <textarea
                         value={code}
@@ -1189,6 +1213,50 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                                     + `${new Date(parsed.messages[0].timestamp).toLocaleString()} → ${new Date(parsed.messages[parsed.messages.length - 1].timestamp).toLocaleString()}`
                                     + (parsed.skipped > 0 ? ` · ${parsed.skipped} can't be shown here and will be left out` : "")
                                 : parsed.error}
+                        </div>
+                    )}
+                    {parsed?.ok && (
+                        <div style={{ marginTop: "12px" }}>
+                            <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px" }}>
+                                When should it start? The whole chat shifts to begin at this time — the gaps between messages stay the same.
+                            </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                                <input
+                                    type="datetime-local"
+                                    value={startAt}
+                                    onChange={e => setStartAt(e.currentTarget.value)}
+                                    style={{
+                                        padding: "8px 10px", borderRadius: "8px",
+                                        border: "1px solid var(--background-modifier-accent)",
+                                        background: "var(--input-background, var(--background-secondary))",
+                                        color: "var(--text-normal)", colorScheme: "dark", fontSize: "13px"
+                                    }}
+                                />
+                                <Button
+                                    size="small"
+                                    variant="secondary"
+                                    onClick={() => {
+                                        const span = parsed.messages[parsed.messages.length - 1].timestamp - parsed.messages[0].timestamp;
+                                        setStartAt(toLocalInput(Date.now() - span));
+                                    }}
+                                >
+                                    End just now
+                                </Button>
+                                <Button size="small" variant="secondary" onClick={() => setStartAt(toLocalInput(parsed.messages[0].timestamp))}>
+                                    Original time
+                                </Button>
+                            </div>
+                            {(() => {
+                                const want = startAt ? new Date(startAt).getTime() : NaN;
+                                const delta = Number.isFinite(want) ? want - parsed.messages[0].timestamp : 0;
+                                if (!delta) return null;
+                                const last = parsed.messages[parsed.messages.length - 1].timestamp + delta;
+                                return (
+                                    <div style={{ fontSize: "12px", color: "var(--text-muted)", marginTop: "6px" }}>
+                                        Will import as {new Date(want).toLocaleString()} → {new Date(last).toLocaleString()}
+                                    </div>
+                                );
+                            })()}
                         </div>
                     )}
                     {parsed?.ok && importAuthors.length > 0 && (
