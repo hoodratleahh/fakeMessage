@@ -45,10 +45,11 @@ A data code is a chat as JSON — `{ "format": "localmessagepreview", "version":
 - **Retime the chat:** a start-time picker (pre-filled with the chat's own first time) shifts every message by the same amount, so the conversation starts when you say while the gaps between messages stay real. **End just now** retimes it so the last message landed a moment ago; **Original time** puts it back.
 - **Replace authors:** after pasting, each distinct author in the code gets a row with an optional "replacement user ID" field — leave it blank to keep the original, or paste a user ID to show that person's messages as someone else (like the Rain plugin's paste-a-user-ID-and-apply). Authors that aren't in your cache still render fine on their own; replacing with a user you share a server/DM with just gives a correct avatar.
 - **Copy:** in the same tab, **Copy this chat as data code** copies what is on screen (real and fake messages). Or run `/fakeexport`.
-- Imported messages keep their text. Attachments (images, videos, files) come in as a labelled `📎 filename` with the URL shown as inert code, not inline media — a fake (injected) message can't mount Discord's media player without crashing the renderer, and Discord auto-renders bare links to its own CDN (or any direct media URL) as that player even from plain text, so any such URL in imported content is wrapped in a code span to keep it harmless. Embeds are not rebuilt (a link embed keeps its address as text); stickers, replies and reactions are dropped. Up to 500 fake messages per channel.
+- Imported messages keep their text, and attachments (images, videos, files) come in as **real attachments** — they render inline exactly like a genuine upload. Note that Discord's file links expire after about a day, so media from an old data code may show as unavailable until you copy a fresh code from the source chat. If a carried file ever misbehaves, turn off **Show imported media** in the plugin settings to fall back to text-only. Embeds are not rebuilt (a link embed keeps its address as text); stickers, replies and reactions are dropped. Up to 500 fake messages per channel.
 
 ### 5. Settings
 - **Persist fake messages** — keep fakes across restarts (on by default).
+- **Show imported media** — render an imported chat's images/videos inline (on by default); turn off to fall back to text-only if a file misbehaves.
 - **Show 👻 chat bar button / Show 📞 call button / Show 📲 incoming button** — toggle each chat-bar button on/off.
 - **Clear all fake messages** — removes every fake everywhere.
 
@@ -61,7 +62,7 @@ A data code is a chat as JSON — `{ "format": "localmessagepreview", "version":
 ## Known limitations (v1)
 
 - Links in fake messages don't auto-fetch embeds (Discord only embeds messages it received from the server).
-- No attachments / reactions / stickers — text, markdown, and mentions only.
+- Manually created fakes are text-only (imported chats do carry their images and videos); no reactions or stickers.
 - The message won't move the unread divider or trigger mentions for other people (it's client-side).
 
 ## Install

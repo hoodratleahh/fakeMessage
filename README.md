@@ -41,7 +41,7 @@ Watch the whole flow: click the 👻 button, search for who should have sent it,
 - **🖱 Context menus** — right-click any user → **Fake Message** (pre-selected for you); right-click a fake message → **Remove Fake Message** / **Remove Fake Call**.
 - **⏱ Backdating** — the fake slots into history at the right position with the matching timestamp.
 - **💾 Persistence** — fakes survive restarts and channel switches (stored in plugin settings, toggleable).
-- **📥 Import / export chats as data codes** — copy any chat (real or fake) as a JSON data code and import it into another channel with the original authors and timestamps, optionally retiming the whole chat (pick a new start, gaps stay real) and swapping each author for a user ID you choose. Same format as the LocalMessagePreview plugin for Rain (iOS/Android), so whole chats move between phone and PC. `👻 → 📥 Import`, or `/fakeimport` / `/fakeexport`.
+- **📥 Import / export chats as data codes** — copy any chat (real or fake) as a JSON data code and import it into another channel with the original authors and timestamps, with their images and videos rendered inline as real attachments, optionally retiming the whole chat (pick a new start, gaps stay real) and swapping each author for a user ID you choose. Same format as the LocalMessagePreview plugin for Rain (iOS/Android), so whole chats move between phone and PC. `👻 → 📥 Import`, or `/fakeimport` / `/fakeexport`.
 - **🔒 Client-side only** — nothing is uploaded, synced, or sent. Nobody else sees your fakes.
 
 ## How it looks

@@ -39,6 +39,8 @@ interface StoredFakeMessage {
     call?: { durationSeconds: number; missed?: boolean };
     /** True for messages added by importing a chat (used to replace them on re-import). */
     imported?: boolean;
+    /** Files carried over by an imported chat, in Discord's API attachment shape. */
+    attachments?: Record<string, any>[];
 }
 
 const MAX_FAKES_PER_CHANNEL = 50;
@@ -126,6 +128,12 @@ const settings = definePluginSettings({
     showIncomingButton: {
         type: OptionType.BOOLEAN,
         description: "Show the 📲 incoming-call button in the chat bar",
+        restartNeeded: false,
+        default: true
+    },
+    showImportedMedia: {
+        type: OptionType.BOOLEAN,
+        description: "Render an imported chat's images and videos inline, like real attachments. Turn off if a chat with media misbehaves",
         restartNeeded: false,
         default: true
     },
@@ -470,12 +478,15 @@ function buildMessage(fake: StoredFakeMessage, base: Message | null): Message | 
         deleted: undefined
     };
 
+    // Imported attachments render as real inline media. "Show imported media"
+    // is the escape hatch if a carried file ever upsets the renderer.
+    const attachments = settings.store.showImportedMedia !== false && Array.isArray(fake.attachments)
+        ? fake.attachments
+        : [];
+
     // Content-derived fields that must not leak over from the base message.
-    // attachments stays empty: a fake message is not a real server record, and
-    // Discord's media player crashes when mounted on one. Imported media is kept
-    // as a link in the text instead (see attachmentLinks).
     const clean: Record<string, any> = {
-        attachments: [],
+        attachments,
         embeds: [],
         reactions: [],
         components: [],
@@ -498,6 +509,11 @@ function buildMessage(fake: StoredFakeMessage, base: Message | null): Message | 
         premiumGroupInviteId: null,
         customRenderedContent: null
     };
+
+    // A media-only message with its media hidden would otherwise render empty.
+    if ((fake.attachments?.length ?? 0) > 0 && attachments.length === 0 && !fake.content) {
+        clean.content = "📎 media hidden — turn on \"Show imported media\" in the plugin settings";
+    }
 
     // Call log entries are system messages (type 3): no text content, and a
     // `call` record describing the duration + who was on the call. Discord's
@@ -541,7 +557,7 @@ function buildMessage(fake: StoredFakeMessage, base: Message | null): Message | 
         activityInstance: null,
         application: null,
         applicationId: null,
-        attachments: [],
+        attachments,
         call: null,
         changelogId: null,
         codedLinks: [],
@@ -720,6 +736,7 @@ interface ImportedMessage {
     author: Record<string, any>;
     content: string;
     timestamp: number;
+    attachments: Record<string, any>[];
 }
 
 interface ParsedDataCode {
@@ -729,30 +746,24 @@ interface ParsedDataCode {
     skipped: number;
 }
 
-// A fake (injected) message isn't a real server record, and Discord's inline
-// image/video player crashes the renderer when mounted on one. Discord renders a
-// bare link to its OWN CDN (or any direct media-file URL) as that inline player,
-// even from plain message text — so such a URL anywhere in a fake message's
-// content must be neutralised. Wrapping it in a code span keeps it visible and
-// copyable but makes Discord treat it as inert text.
-const AUTO_MEDIA_URL = /https?:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/\S+|https?:\/\/\S+?\.(?:mp4|mov|webm|mkv|m4v|png|jpe?g|gif|gifv|webp|avif|mp3|ogg|wav|flac|m4a)(?:\?\S*)?/gi;
-
-function neutralizeMedia(text: string): string {
-    return text.replace(AUTO_MEDIA_URL, m => "`" + m + "`");
-}
-
-// Each attachment becomes a labelled link appended to the message text; the URL
-// is neutralised later (see neutralizeMedia) so it never renders as inline media.
-function attachmentLinks(raw: any): string[] {
+// Imported files are carried in Discord's own attachment shape and rendered by
+// Discord as real inline media. Only entries with a usable https URL survive;
+// the id must be a numeric snowflake or the renderer's keying chokes on it.
+function sanitizeAttachments(raw: any, ts: number): Record<string, any>[] {
     if (!Array.isArray(raw)) return [];
     return raw
-        .filter(a => a && typeof a.url === "string")
-        .map(a => {
-            const name = typeof a.filename === "string" && a.filename
+        .filter(a => a && typeof a.url === "string" && /^https:\/\//i.test(a.url))
+        .slice(0, 10)
+        .map(a => ({
+            ...a,
+            id: /^\d{5,25}$/.test(String(a.id ?? "")) ? String(a.id) : makeMessageId(ts),
+            filename: typeof a.filename === "string" && a.filename
                 ? a.filename
-                : a.url.split("?")[0].split("/").pop() || "attachment";
-            return `📎 ${name}\n${a.url}`;
-        });
+                : (a.url.split("?")[0].split("/").pop() || "file"),
+            proxy_url: typeof a.proxy_url === "string" ? a.proxy_url : a.url,
+            size: Number.isFinite(a.size) ? a.size : 0,
+            spoiler: a.spoiler === true
+        }));
 }
 
 /** Accepts a data code, a bare list of messages, or a single message. Throws with a readable reason. */
@@ -778,14 +789,13 @@ function parseDataCode(text: string): ParsedDataCode {
         if (!a || !USER_ID_RE.test(String(a.id)) || !Number.isFinite(timestamp)) { skipped++; continue; }
 
         let content = typeof item.content === "string" ? item.content : "";
-        const links = attachmentLinks(item.attachments);
-        if (!content && links.length === 0) {
+        const attachments = sanitizeAttachments(item.attachments, timestamp);
+        if (!content && attachments.length === 0) {
             // Embeds aren't rebuilt here; keep a link embed's address so the message is not lost.
             const embed = Array.isArray(item.embeds) ? item.embeds.find((e: any) => e?.url || e?.description) : null;
             content = embed?.url ?? embed?.description ?? "";
         }
-        const full = neutralizeMedia([content, ...links].filter(Boolean).join("\n"));
-        if (!full) { skipped++; continue; }
+        if (!content && attachments.length === 0) { skipped++; continue; }
 
         messages.push({
             authorId: String(a.id),
@@ -797,8 +807,9 @@ function parseDataCode(text: string): ParsedDataCode {
                 avatar: a.avatar ?? null,
                 bot: Boolean(a.bot)
             },
-            content: full,
-            timestamp
+            content,
+            timestamp,
+            attachments
         });
     }
 
@@ -840,7 +851,8 @@ function importDataCode(channelId: string, text: string, remap?: AuthorRemap, sh
             author: sub ? sub.author : m.author,
             content: m.content,
             timestamp: m.timestamp,
-            imported: true
+            imported: true,
+            ...(m.attachments.length > 0 ? { attachments: m.attachments } : {})
         });
     });
 
