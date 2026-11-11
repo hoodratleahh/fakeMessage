@@ -8,9 +8,15 @@ import { addChatBarButton, ChatBarButton, removeChatBarButton } from "@api/ChatB
 import { ApplicationCommandInputType, ApplicationCommandOptionType, findOption, sendBotMessage } from "@api/Commands";
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
+import { Button } from "@components/Button";
+import { Switch } from "@components/Switch";
+import { copyToClipboard } from "@utils/clipboard";
 import definePlugin, { IconComponent, OptionType } from "@utils/types";
 import { Message, RenderModalProps, User } from "@vencord/discord-types";
-import { Button, createRoot, Menu, MessageStore, Modal, moment, openModal, React, SelectedChannelStore, showToast, Switch, TextArea, TextInput, UserStore, UserUtils } from "@webpack/common";
+import { ChannelStore, createRoot, Menu, MessageStore, Modal, moment, openModal, React, SelectedChannelStore, showToast as vcShowToast, TextArea, TextInput, UserStore, UserUtils } from "@webpack/common";
+
+// Newer Vencord builds take a ToastData object instead of a plain string.
+const showToast = (text: string) => vcShowToast({ text });
 
 /**
  * A fake message is just like a real Discord message, except:
@@ -21,6 +27,7 @@ import { Button, createRoot, Menu, MessageStore, Modal, moment, openModal, React
  * message is injected into the real MessageStore.
  */
 interface StoredFakeMessage {
+    /** A real Discord-style snowflake (numeric string) encoding `timestamp`. */
     id: string;
     channelId: string;
     authorId: string;
@@ -30,14 +37,72 @@ interface StoredFakeMessage {
     timestamp: number;
     /** When present, this fake renders as a call log entry (system message) instead of a text message */
     call?: { durationSeconds: number; missed?: boolean };
+    /** True for messages added by importing a chat (used to replace them on re-import). */
+    imported?: boolean;
 }
 
-const ID_PREFIX = "fakemessage-";
 const MAX_FAKES_PER_CHANNEL = 50;
+
+// Fake messages must use a real snowflake id, not a "fakemessage-…" string:
+// Discord does snowflake math (BigInt(id)) on message ids when ordering/grouping
+// them, which throws on a non-numeric id — and "Copy Message ID" should give a
+// normal numeric id. The id encodes the message's own timestamp so it also sorts
+// correctly. A random, per-session starting increment keeps ids unique across
+// restarts and imports.
+const DISCORD_EPOCH = 1420070400000;
+let snowflakeSeq = Math.floor(Math.random() * 0x3fffff);
+
+function makeMessageId(ms: number): string {
+    const safeMs = Number.isFinite(ms) ? Math.floor(ms) : Date.now();
+    const since = BigInt(Math.max(safeMs, DISCORD_EPOCH + 1) - DISCORD_EPOCH);
+    const inc = BigInt((snowflakeSeq++) & 0x3fffff);
+    return String((since << 22n) | inc);
+}
+/** Imported chats are whole conversations, so they get a far higher ceiling. */
+const MAX_IMPORTED_PER_CHANNEL = 500;
 
 let fakes: StoredFakeMessage[] = [];
 let originalGetMessages: ((channelId?: string) => any) | null = null;
 let originalGetMessage: ((channelId: string, messageId: string) => any) | null = null;
+
+// The merged list is asked for many times per render. It only changes when the
+// channel's real messages or the fakes do, so it is rebuilt only then.
+let fakesVersion = 0;
+const combinedCache = new Map<string, { source: any[]; length: number; version: number; out: any[]; }>();
+
+// getUser is patched so a fake author who isn't in Discord's cache (common for
+// imported chats) still resolves to a usable User instead of undefined — an
+// undefined author crashes the message renderer. Hydrated users are cached and
+// dropped whenever the fakes change.
+let originalGetUser: ((id: string) => any) | null = null;
+const hydratedUsers = new Map<string, User>();
+
+// Diagnostics: the last page error while the plugin is active is saved into the
+// plugin's own settings (readable in settings.json) so a crash can be inspected
+// after the fact instead of guessed at. Best-effort — a render error caught by
+// Discord's own error boundary may not reach these listeners.
+let onPageError: ((e: ErrorEvent) => void) | null = null;
+let onPageRejection: ((e: PromiseRejectionEvent) => void) | null = null;
+let origConsoleError: ((...args: any[]) => void) | null = null;
+
+function recordCrash(label: string, err: any) {
+    try {
+        const msg = String(err?.message ?? err ?? "");
+        // Benign, extremely common browser warnings — not real crashes.
+        if (/ResizeObserver loop|Non-Error promise rejection/i.test(msg)) return;
+        const entry = {
+            at: new Date().toISOString(),
+            label,
+            message: String(err?.message ?? err ?? "unknown"),
+            stack: String(err?.stack ?? "").slice(0, 3000)
+        };
+        let list: any[] = [];
+        try { const prev = JSON.parse((settings.store as any).lastCrash || "[]"); if (Array.isArray(prev)) list = prev; } catch { /* reset */ }
+        list.push(entry);
+        // Keep the last few so an unrelated error can't bury the relevant one.
+        (settings.store as any).lastCrash = JSON.stringify(list.slice(-6));
+    } catch { /* nothing we can do */ }
+}
 
 const settings = definePluginSettings({
     persist: {
@@ -68,8 +133,8 @@ const settings = definePluginSettings({
         type: OptionType.COMPONENT,
         component: () => (
             <Button
-                color={Button.Colors.RED}
-                size={Button.Sizes.SMALL}
+                variant="dangerPrimary"
+                size="small"
                 onClick={() => {
                     fakes = [];
                     saveFakes();
@@ -87,12 +152,26 @@ const settings = definePluginSettings({
 
 function loadFakes() {
     fakes = [];
+    fakesVersion++;
+    hydratedUsers.clear();
     if (!settings.store.persist) return;
     try {
         const raw = (settings.store as any).fakeMessages;
         if (typeof raw === "string" && raw) {
             const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) fakes = parsed;
+            if (Array.isArray(parsed)) {
+                // Upgrade messages saved by older versions (which used a
+                // "fakemessage-…" id) to a real numeric snowflake, so Discord's
+                // snowflake math and "Copy Message ID" work. Done once, then saved.
+                let migrated = false;
+                fakes = parsed.map((f: any) => {
+                    if (!f || typeof f.id !== "string" || /^\d{15,25}$/.test(f.id)) return f;
+                    migrated = true;
+                    const wasImport = /^fakemessage-\d+-[a-z0-9]+-\d+$/.test(f.id);
+                    return { ...f, id: makeMessageId(Number(f.timestamp) || Date.now()), imported: f.imported ?? wasImport };
+                });
+                if (migrated) saveFakes();
+            }
         }
     } catch (e) {
         console.error("[FakeMessage] Failed to load fake messages:", e);
@@ -100,6 +179,8 @@ function loadFakes() {
 }
 
 function saveFakes() {
+    fakesVersion++;
+    hydratedUsers.clear();
     try {
         (settings.store as any).fakeMessages = JSON.stringify(settings.store.persist ? fakes : []);
     } catch (e) {
@@ -125,12 +206,26 @@ function wrapMessages(collection: any, channelId?: string): any {
     const getFake = (id: string) => getFakesForChannel(channelId).find(f => f.id === id);
     const makeMessage = (fake: StoredFakeMessage) =>
         buildMessage(fake, real().find((m: any) => m && !m._isFake) ?? null);
-    const combined = () => {
+    const combined = (): any[] => {
+        const source = real();
+        const hit = combinedCache.get(channelId!);
+        if (hit && hit.source === source && hit.length === source.length && hit.version === fakesVersion) return hit.out;
+
         const fakeMessages = getFakesForChannel(channelId)
-            .map(makeMessage)
+            .map(f => {
+                // Guard: a single malformed fake must never throw out of getMessages
+                // and take the whole channel's message list down with it.
+                try { return makeMessage(f); } catch (e) {
+                    console.error("[FakeMessage] skipped a fake that failed to build:", e);
+                    return null;
+                }
+            })
             .filter((m): m is Message => m !== null);
-        if (fakeMessages.length === 0) return real();
-        return [...real(), ...fakeMessages].sort((a, b) => +a.timestamp - +b.timestamp);
+        const out = fakeMessages.length === 0
+            ? source
+            : [...source, ...fakeMessages].sort((a, b) => +a.timestamp - +b.timestamp);
+        combinedCache.set(channelId!, { source, length: source.length, version: fakesVersion, out });
+        return out;
     };
 
     return new Proxy(collection, {
@@ -147,7 +242,8 @@ function wrapMessages(collection: any, channelId?: string): any {
                 case "_array":
                     return combined();
                 case "toArray":
-                    return combined;
+                    // A copy: callers are free to reorder what toArray hands them.
+                    return () => [...combined()];
                 case "get":
                     return (id: string) => {
                         const fake = getFake(id);
@@ -207,6 +303,17 @@ function patchStore() {
         if (found) return found;
         return originalGetMessage!(channelId, messageId);
     };
+    // A fake author who isn't in the cache would make getUser return undefined,
+    // and the message renderer crashes on an undefined author. Fall back to a
+    // hydrated user for known fake authors; real users always take precedence.
+    if (UserStore && (UserStore as any).getUser) {
+        originalGetUser = (UserStore as any).getUser.bind(UserStore);
+        (UserStore as any).getUser = function (this: any, id: string) {
+            const real = originalGetUser!(id);
+            if (real) return real;
+            return fakeAuthorUser(id) ?? real;
+        };
+    }
 }
 
 function unpatchStore() {
@@ -218,6 +325,11 @@ function unpatchStore() {
         (MessageStore as any).getMessage = originalGetMessage;
         originalGetMessage = null;
     }
+    if (originalGetUser) {
+        (UserStore as any).getUser = originalGetUser;
+        originalGetUser = null;
+    }
+    hydratedUsers.clear();
 }
 
 /** Force the chat (and anything else subscribed to MessageStore) to re-render. */
@@ -242,10 +354,38 @@ function extractIds(re: RegExp, content: string): string[] {
     return ids;
 }
 
-/** Build a minimal-but-functional User for fakes whose author left the cache. */
+/**
+ * Build a User for a fake whose author isn't in Discord's cache.
+ *
+ * It CLONES the logged-in User so the result carries Discord's real User
+ * prototype — every method the message renderer calls (isNonUserBot, hasFlag,
+ * getAvatarURL, …). The previous hand-built object was missing methods and
+ * crashed the renderer, which is what broke chat imports (the imported authors
+ * aren't cached, so they always went down this path).
+ */
 function hydrateUser(json: Record<string, any>): User | null {
     if (!json?.id) return null;
-    const avatar = json.avatar || json.avatarDecoration?.asset ? json.avatar || json.avatarDecoration.asset : undefined;
+
+    const base: any = UserStore.getCurrentUser();
+    if (base) {
+        const u: any = Object.create(Object.getPrototypeOf(base));
+        Object.assign(u, base, {
+            id: String(json.id),
+            username: json.username ?? "Unknown",
+            globalName: json.globalName ?? json.global_name ?? null,
+            discriminator: json.discriminator ?? "0",
+            avatar: typeof json.avatar === "string" ? json.avatar : null,
+            avatarDecorationData: json.avatarDecoration ?? json.avatarDecorationData ?? null,
+            banner: null,
+            accentColor: json.accentColor ?? null,
+            bot: Boolean(json.bot),
+            system: false,
+            publicFlags: json.publicFlags ?? 0
+        });
+        return u as User;
+    }
+
+    // Not logged in (no User to clone) — fall back to a minimal hand-built one.
     const user: any = {
         ...json,
         getAvatarURL: (_guildId?: string, size = 128, _animated = false) => {
@@ -259,15 +399,32 @@ function hydrateUser(json: Record<string, any>): User | null {
         getAvatarDecorationURL: () => undefined,
         getBannerURL: () => undefined,
         getAccentColor: () => json.accentColor ?? null,
+        isNonUserBot: () => false,
+        isSystemUser: () => false,
+        isVerifiedBot: () => false,
+        isClyde: () => false,
+        hasAvatarForGuild: () => false,
+        hasFlag: () => false,
         toString: () => json.globalName ?? json.username ?? json.id
     };
     return user as User;
 }
 
+/** The hydrated User for a fake author id, if any stored fake uses it (cached). */
+function fakeAuthorUser(id: string): User | null {
+    const hit = hydratedUsers.get(id);
+    if (hit) return hit;
+    const fake = fakes.find(f => f.authorId === id && f.author);
+    if (!fake?.author) return null;
+    const u = hydrateUser(fake.author);
+    if (u) hydratedUsers.set(id, u);
+    return u;
+}
+
 function resolveAuthor(fake: StoredFakeMessage): User | undefined {
     const cached = UserStore.getUser(fake.authorId);
     if (cached) return cached;
-    if (fake.author) return hydrateUser(fake.author) ?? undefined;
+    if (fake.author) return fakeAuthorUser(fake.authorId) ?? hydrateUser(fake.author) ?? undefined;
     return undefined;
 }
 
@@ -313,7 +470,10 @@ function buildMessage(fake: StoredFakeMessage, base: Message | null): Message | 
         deleted: undefined
     };
 
-    // Content-derived fields that must not leak over from the base message
+    // Content-derived fields that must not leak over from the base message.
+    // attachments stays empty: a fake message is not a real server record, and
+    // Discord's media player crashes when mounted on one. Imported media is kept
+    // as a link in the text instead (see attachmentLinks).
     const clean: Record<string, any> = {
         attachments: [],
         embeds: [],
@@ -471,14 +631,14 @@ function injectFakeMessage(channelId: string, author: User, content: string, min
         return;
     }
 
-    const id = `${ID_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = Date.now() - Math.max(0, minutesAgo) * 60_000;
     fakes.push({
-        id,
+        id: makeMessageId(timestamp),
         channelId,
         authorId: author.id,
         author: snapshotUser(author),
         content: text,
-        timestamp: Date.now() - Math.max(0, minutesAgo) * 60_000
+        timestamp
     });
 
     saveFakes();
@@ -510,14 +670,14 @@ function injectFakeCall(channelId: string, author: User, durationSeconds: number
         return;
     }
 
-    const id = `${ID_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = Date.now() - Math.max(0, minutesAgo) * 60_000;
     fakes.push({
-        id,
+        id: makeMessageId(timestamp),
         channelId,
         authorId: author.id,
         author: snapshotUser(author),
         content: "",
-        timestamp: Date.now() - Math.max(0, minutesAgo) * 60_000,
+        timestamp,
         call: { durationSeconds, missed }
     });
 
@@ -544,6 +704,203 @@ function removeFakesForChannel(channelId: string) {
         saveFakes();
         refresh();
     }
+}
+
+// --- data codes ---------------------------------------------------------------
+// A data code is a chat as JSON: { format, version, name, messages }, each
+// message in Discord's own API shape (content, timestamp, author, attachments,
+// embeds). It is what the LocalMessagePreview plugin for Rain copies, and what
+// this plugin copies back, so a chat can be carried between the two.
+
+const DATA_FORMAT = "localmessagepreview";
+const USER_ID_RE = /^\d{15,25}$/;
+
+interface ImportedMessage {
+    authorId: string;
+    author: Record<string, any>;
+    content: string;
+    timestamp: number;
+}
+
+interface ParsedDataCode {
+    name: string;
+    messages: ImportedMessage[];
+    /** Entries that can't be shown here: nothing but an embed or sticker, or malformed */
+    skipped: number;
+}
+
+// A fake (injected) message isn't a real server record, and Discord's inline
+// image/video player crashes the renderer when mounted on one. Discord renders a
+// bare link to its OWN CDN (or any direct media-file URL) as that inline player,
+// even from plain message text — so such a URL anywhere in a fake message's
+// content must be neutralised. Wrapping it in a code span keeps it visible and
+// copyable but makes Discord treat it as inert text.
+const AUTO_MEDIA_URL = /https?:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/\S+|https?:\/\/\S+?\.(?:mp4|mov|webm|mkv|m4v|png|jpe?g|gif|gifv|webp|avif|mp3|ogg|wav|flac|m4a)(?:\?\S*)?/gi;
+
+function neutralizeMedia(text: string): string {
+    return text.replace(AUTO_MEDIA_URL, m => "`" + m + "`");
+}
+
+// Each attachment becomes a labelled link appended to the message text; the URL
+// is neutralised later (see neutralizeMedia) so it never renders as inline media.
+function attachmentLinks(raw: any): string[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .filter(a => a && typeof a.url === "string")
+        .map(a => {
+            const name = typeof a.filename === "string" && a.filename
+                ? a.filename
+                : a.url.split("?")[0].split("/").pop() || "attachment";
+            return `📎 ${name}\n${a.url}`;
+        });
+}
+
+/** Accepts a data code, a bare list of messages, or a single message. Throws with a readable reason. */
+function parseDataCode(text: string): ParsedDataCode {
+    let data: any;
+    try {
+        data = JSON.parse(text.trim());
+    } catch {
+        throw new Error("That isn't a data code (not valid JSON).");
+    }
+
+    let list: any[];
+    if (Array.isArray(data)) list = data;
+    else if (Array.isArray(data?.messages)) list = data.messages;
+    else if (data && typeof data === "object" && data.author) list = [data];
+    else throw new Error("No messages found in that data code.");
+
+    const messages: ImportedMessage[] = [];
+    let skipped = 0;
+    for (const item of list) {
+        const a = item?.author;
+        const timestamp = typeof item?.timestamp === "number" ? item.timestamp : Date.parse(item?.timestamp);
+        if (!a || !USER_ID_RE.test(String(a.id)) || !Number.isFinite(timestamp)) { skipped++; continue; }
+
+        let content = typeof item.content === "string" ? item.content : "";
+        const links = attachmentLinks(item.attachments);
+        if (!content && links.length === 0) {
+            // Embeds aren't rebuilt here; keep a link embed's address so the message is not lost.
+            const embed = Array.isArray(item.embeds) ? item.embeds.find((e: any) => e?.url || e?.description) : null;
+            content = embed?.url ?? embed?.description ?? "";
+        }
+        const full = neutralizeMedia([content, ...links].filter(Boolean).join("\n"));
+        if (!full) { skipped++; continue; }
+
+        messages.push({
+            authorId: String(a.id),
+            author: {
+                id: String(a.id),
+                username: a.username ?? "Unknown",
+                globalName: a.global_name ?? a.globalName ?? null,
+                discriminator: a.discriminator ?? "0",
+                avatar: a.avatar ?? null,
+                bot: Boolean(a.bot)
+            },
+            content: full,
+            timestamp
+        });
+    }
+
+    if (messages.length === 0) throw new Error("No usable messages in that data code.");
+    messages.sort((x, y) => x.timestamp - y.timestamp);
+
+    const name = typeof data?.name === "string" && data.name.trim() ? data.name.trim() : "Imported chat";
+    return { name, messages, skipped };
+}
+
+/** A resolved replacement author, keyed by the original author id it stands in for. */
+type AuthorRemap = Record<string, { authorId: string; author: Record<string, any>; }>;
+
+/**
+ * Add every message of a data code to a channel as fake messages, keeping their
+ * times. `remap` optionally swaps an original author for another user, e.g. to
+ * show someone else's imported messages as a user you choose (and, since the
+ * replacement is a real resolved user, it also sidesteps uncached-author issues).
+ */
+function importDataCode(channelId: string, text: string, remap?: AuthorRemap): ParsedDataCode {
+    const parsed = parseDataCode(text);
+
+    // Re-importing a chat replaces the previous import into this channel instead
+    // of stacking a duplicate copy on top of it (messages made by hand are kept).
+    fakes = fakes.filter(f => !(f.channelId === channelId && f.imported));
+
+    const room = MAX_IMPORTED_PER_CHANNEL - getFakesForChannel(channelId).length;
+    if (parsed.messages.length > room) {
+        throw new Error(`That chat has ${parsed.messages.length} messages but this channel only has room for ${Math.max(room, 0)} more fake ones. Clear some first.`);
+    }
+
+    parsed.messages.forEach(m => {
+        const sub = remap?.[m.authorId];
+        fakes.push({
+            id: makeMessageId(m.timestamp),
+            channelId,
+            authorId: sub ? sub.authorId : m.authorId,
+            author: sub ? sub.author : m.author,
+            content: m.content,
+            timestamp: m.timestamp,
+            imported: true
+        });
+    });
+
+    saveFakes();
+    refresh();
+    return parsed;
+}
+
+function embedToRaw(embed: any): Record<string, any> {
+    const out: Record<string, any> = { type: embed?.type ?? "rich" };
+    const title = embed?.rawTitle ?? embed?.title;
+    const description = embed?.rawDescription ?? embed?.description;
+    if (typeof title === "string") out.title = title;
+    if (typeof description === "string") out.description = description;
+    if (typeof embed?.url === "string") out.url = embed.url;
+    for (const key of ["image", "thumbnail", "video"]) {
+        const media = embed?.[key];
+        if (media?.url) out[key] = { url: media.url, proxy_url: media.proxyURL ?? media.proxy_url ?? media.url, width: media.width, height: media.height };
+    }
+    return out;
+}
+
+function chatName(channelId: string): string {
+    const channel: any = ChannelStore.getChannel(channelId);
+    if (channel?.name) return channel.name;
+    const names = (channel?.recipients ?? [])
+        .map((id: string) => UserStore.getUser(id))
+        .filter(Boolean)
+        .map((u: any) => u.globalName ?? u.username);
+    return names.join(", ") || "Chat";
+}
+
+/** The channel as it is on screen right now (real and fake messages) as a data code. */
+function exportDataCode(channelId: string): { code: string; count: number; } {
+    const collection: any = MessageStore.getMessages(channelId);
+    const list: any[] = collection?._array ?? [];
+    const messages = list
+        .filter(m => m?.author?.id && (m.type === 0 || m.type === 19))
+        .map(m => ({
+            content: m.content ?? "",
+            timestamp: new Date(+m.timestamp).toISOString(),
+            edited_timestamp: m.editedTimestamp ? new Date(+m.editedTimestamp).toISOString() : null,
+            author: {
+                id: m.author.id,
+                username: m.author.username,
+                global_name: m.author.globalName ?? null,
+                avatar: m.author.avatar ?? null,
+                discriminator: m.author.discriminator ?? "0",
+                bot: Boolean(m.author.bot)
+            },
+            attachments: JSON.parse(JSON.stringify(m.attachments ?? [])),
+            embeds: (m.embeds ?? []).map(embedToRaw)
+        }));
+
+    const code = JSON.stringify({ format: DATA_FORMAT, version: 1, name: chatName(channelId), messages }, null, 2);
+    return { code, count: messages.length };
+}
+
+async function readClipboard(): Promise<string> {
+    const native = (window as any).DiscordNative?.clipboard?.read;
+    return String((typeof native === "function" ? await native() : await navigator.clipboard.readText()) ?? "");
 }
 
 // --- UI ----------------------------------------------------------------------
@@ -602,11 +959,7 @@ const IncomingCallIcon: IconComponent = ({ height = 22, width = 22, className })
     </svg>
 );
 
-// `Switch` from @webpack/common is a deprecated export typed as `never`; it's
-// the FormSwitchCompat component at runtime, which takes `note` + children.
-const FormSwitch = Switch as any;
-
-type ModalMode = "message" | "call" | "incoming";
+type ModalMode = "message" | "call" | "incoming" | "import";
 
 function openFakeMessageModal(user?: User, channelId?: string, mode: ModalMode = "message") {
     const targetChannel = channelId ?? SelectedChannelStore.getChannelId();
@@ -625,6 +978,29 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
     const [minutesAgo, setMinutesAgo] = React.useState("0");
     const [fetching, setFetching] = React.useState(false);
     const [fetchError, setFetchError] = React.useState<string | null>(null);
+    const [code, setCode] = React.useState("");
+    const [remap, setRemap] = React.useState<Record<string, string>>({});
+    const [importing, setImporting] = React.useState(false);
+
+    // What the pasted data code holds, or why it can't be used.
+    const parsed = React.useMemo(() => {
+        if (!code.trim()) return null;
+        try {
+            return { ok: true as const, ...parseDataCode(code) };
+        } catch (e) {
+            return { ok: false as const, error: (e as Error).message };
+        }
+    }, [code]);
+
+    // The distinct authors in the pasted code, each of which can be replaced.
+    const importAuthors = React.useMemo(() => {
+        if (!parsed?.ok) return [] as { id: string; label: string; }[];
+        const seen = new Map<string, string>();
+        for (const m of parsed.messages) {
+            if (!seen.has(m.authorId)) seen.set(m.authorId, m.author.globalName || m.author.username || m.authorId);
+        }
+        return [...seen].map(([id, label]) => ({ id, label }));
+    }, [parsed]);
 
     const results = React.useMemo(() => {
         const q = query.trim().toLowerCase();
@@ -654,7 +1030,40 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
         }
     };
 
-    const insert = () => {
+    const insert = async () => {
+        if (mode === "import") {
+            if (importing) return;
+            setImporting(true);
+            try {
+                // Load EVERY author through Discord so each fake message is attributed
+                // to a real, cached User — the same kind of object a normal fake message
+                // uses. A replacement ID (if typed) is loaded instead of the original.
+                // Fabricated/uncached authors are the fragile path, so we avoid them.
+                const resolved: AuthorRemap = {};
+                let failed = 0;
+                for (const a of importAuthors) {
+                    const replaceId = (remap[a.id] || "").trim();
+                    if (replaceId && !/^\d{15,25}$/.test(replaceId)) throw new Error(`"${replaceId}" isn't a valid user ID.`);
+                    const targetId = replaceId || a.id;
+                    const u = UserStore.getUser(targetId) ?? await UserUtils.getUser(targetId).catch(() => null);
+                    if (u) resolved[a.id] = { authorId: u.id, author: snapshotUser(u) };
+                    else failed++; // couldn't load this one; it keeps its saved snapshot
+                }
+                const replaced = importAuthors.filter(a => (remap[a.id] || "").trim()).length;
+                const result = importDataCode(channelId, code, resolved);
+                const notes = [
+                    replaced ? `${replaced} replaced` : "",
+                    failed ? `${failed} user(s) couldn't be loaded` : ""
+                ].filter(Boolean).join(" · ");
+                showToast(`Imported ${result.messages.length} message(s) from "${result.name}"${notes ? ` · ${notes}` : ""}`);
+                modalProps.onClose();
+            } catch (e) {
+                showToast((e as Error).message);
+            } finally {
+                setImporting(false);
+            }
+            return;
+        }
         if (!user) return;
         if (mode === "call") {
             injectFakeCall(channelId, user, missed ? 0 : parseDuration(duration), Number(minutesAgo) || 0, missed);
@@ -675,41 +1084,140 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
         <Modal
             {...modalProps}
             size="medium"
-            title={mode === "call" ? "Fake Call" : mode === "incoming" ? "Incoming Call" : "Fake Message"}
+            title={mode === "call" ? "Fake Call" : mode === "incoming" ? "Incoming Call" : mode === "import" ? "Import Chat" : "Fake Message"}
             actions={[
                 { text: "Cancel", variant: "secondary", onClick: modalProps.onClose },
                 {
-                    text: mode === "incoming" ? "Call" : "Insert",
+                    text: mode === "incoming" ? "Call" : mode === "import" ? (importing ? "Importing…" : "Import") : "Insert",
                     variant: "primary",
                     onClick: insert,
-                    disabled: !user || (mode === "message" && !content.trim())
+                    disabled: mode === "import" ? (!parsed?.ok || importing) : !user || (mode === "message" && !content.trim())
                 }
             ]}
         >
             <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
                 <Button
-                    size={Button.Sizes.SMALL}
-                    color={mode === "message" ? Button.Colors.BRAND : Button.Colors.PRIMARY}
+                    size="small"
+                    variant={mode === "message" ? "primary" : "secondary"}
                     onClick={() => setMode("message")}
                 >
                     💬 Message
                 </Button>
                 <Button
-                    size={Button.Sizes.SMALL}
-                    color={mode === "call" ? Button.Colors.BRAND : Button.Colors.PRIMARY}
+                    size="small"
+                    variant={mode === "call" ? "primary" : "secondary"}
                     onClick={() => setMode("call")}
                 >
                     📞 Call
                 </Button>
                 <Button
-                    size={Button.Sizes.SMALL}
-                    color={mode === "incoming" ? Button.Colors.BRAND : Button.Colors.PRIMARY}
+                    size="small"
+                    variant={mode === "incoming" ? "primary" : "secondary"}
                     onClick={() => setMode("incoming")}
                 >
                     📲 Incoming
                 </Button>
+                <Button
+                    size="small"
+                    variant={mode === "import" ? "primary" : "secondary"}
+                    onClick={() => setMode("import")}
+                >
+                    📥 Import
+                </Button>
             </div>
-            {user ? (
+            {mode === "import" ? (
+                <div>
+                    <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px" }}>
+                        Paste a chat's data code. Each person is loaded as a real user and their messages are added here with their original times. Re-importing replaces the last import. Replace anyone below.
+                    </div>
+                    <textarea
+                        value={code}
+                        onChange={e => setCode(e.currentTarget.value)}
+                        placeholder='{ "format": "localmessagepreview", "messages": [ … ] }'
+                        rows={8}
+                        spellCheck={false}
+                        style={{
+                            width: "100%", boxSizing: "border-box", resize: "vertical", padding: "10px",
+                            borderRadius: "8px", border: "1px solid var(--background-modifier-accent)",
+                            background: "var(--input-background, var(--background-secondary))", color: "var(--text-normal)",
+                            fontFamily: "var(--font-code)", fontSize: "12px"
+                        }}
+                    />
+                    <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
+                        <Button
+                            size="small"
+                            variant="secondary"
+                            onClick={async () => {
+                                try {
+                                    setCode(await readClipboard());
+                                } catch {
+                                    showToast("Couldn't read the clipboard — paste into the box instead");
+                                }
+                            }}
+                        >
+                            Paste from clipboard
+                        </Button>
+                        <Button
+                            size="small"
+                            variant="secondary"
+                            onClick={async () => {
+                                const { code: out, count } = exportDataCode(channelId);
+                                if (count === 0) { showToast("No messages in this chat to copy"); return; }
+                                await copyToClipboard(out);
+                                showToast(`Copied this chat's data code (${count} message(s))`);
+                            }}
+                        >
+                            Copy this chat as data code
+                        </Button>
+                        <Button
+                            size="small"
+                            variant="secondary"
+                            onClick={() => {
+                                const n = getFakesForChannel(channelId).length;
+                                if (n === 0) { showToast("No fake messages in this chat"); return; }
+                                removeFakesForChannel(channelId);
+                                showToast(`Cleared ${n} fake message(s) from this chat`);
+                            }}
+                        >
+                            Clear this chat
+                        </Button>
+                    </div>
+                    {parsed && (
+                        <div style={{ fontSize: "12px", marginTop: "10px", color: parsed.ok ? "var(--text-muted)" : "var(--text-danger)" }}>
+                            {parsed.ok
+                                ? `"${parsed.name}" — ${parsed.messages.length} message(s) from ${new Set(parsed.messages.map(m => m.authorId)).size} user(s), `
+                                    + `${new Date(parsed.messages[0].timestamp).toLocaleString()} → ${new Date(parsed.messages[parsed.messages.length - 1].timestamp).toLocaleString()}`
+                                    + (parsed.skipped > 0 ? ` · ${parsed.skipped} can't be shown here and will be left out` : "")
+                                : parsed.error}
+                        </div>
+                    )}
+                    {parsed?.ok && importAuthors.length > 0 && (
+                        <div style={{ marginTop: "12px" }}>
+                            <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px" }}>
+                                Replace an author (optional) — paste a user ID to show that person's messages as someone else. Blank keeps the original. Tip: replacing with a user you share a server/DM with avoids a missing avatar.
+                            </div>
+                            {importAuthors.map(a => (
+                                <div key={a.id} style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" }}>
+                                    <span
+                                        title={a.id}
+                                        style={{ fontSize: "12px", color: "var(--header-primary)", minWidth: "110px", maxWidth: "110px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                                    >
+                                        {a.label}
+                                    </span>
+                                    <span style={{ color: "var(--text-muted)" }}>→</span>
+                                    <div style={{ flex: 1 }}>
+                                        <TextInput
+                                            value={remap[a.id] ?? ""}
+                                            onChange={(v: string) => setRemap(prev => ({ ...prev, [a.id]: v }))}
+                                            placeholder="replacement user ID (optional)"
+                                        />
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            ) : user ? (
                 <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "16px" }}>
                     <img
                         src={user.getAvatarURL(void 0, 64, true)}
@@ -722,7 +1230,7 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                             Client-side only — appears in your chat, nobody else sees it.
                         </div>
                     </div>
-                    <Button size={Button.Sizes.SMALL} color={Button.Colors.PRIMARY} onClick={() => setUser(null)}>
+                    <Button size="small" variant="secondary" onClick={() => setUser(null)}>
                         Change
                     </Button>
                 </div>
@@ -766,8 +1274,8 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                     )}
                     {results.length === 0 && query.trim() && (
                         <Button
-                            size={Button.Sizes.SMALL}
-                            color={Button.Colors.PRIMARY}
+                            size="small"
+                            variant="secondary"
                             onClick={fetchById}
                             disabled={fetching}
                             style={{ marginTop: "8px" }}
@@ -777,7 +1285,7 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                     )}
                 </div>
             )}
-            {mode === "incoming" ? (
+            {mode === "import" ? null : mode === "incoming" ? (
                 <div style={{ fontSize: "13px", color: "var(--text-muted)", lineHeight: 1.5, padding: "8px 0" }}>
                     Shows a full-screen incoming-call screen with <strong>{name ?? "this user"}</strong>'s avatar,
                     a pulsing ring, and accept / decline buttons. Accepting starts a fake call timer.
@@ -794,13 +1302,15 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                         placeholder="5:00"
                     />
                     <div style={{ marginTop: "12px" }}>
-                        <FormSwitch
-                            value={missed}
-                            onChange={setMissed}
-                            note="The call was never answered — renders as a red missed-call entry"
-                        >
-                            Missed call
-                        </FormSwitch>
+                        <label style={{ display: "flex", alignItems: "center", gap: "12px", cursor: "pointer" }}>
+                            <Switch checked={missed} onChange={setMissed} />
+                            <div>
+                                <div style={{ fontWeight: "600", color: "var(--header-primary)" }}>Missed call</div>
+                                <div style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                                    The call was never answered — renders as a red missed-call entry
+                                </div>
+                            </div>
+                        </label>
                     </div>
                 </div>
             ) : (
@@ -812,7 +1322,7 @@ function FakeMessageModal({ initialUser, channelId, modalProps, initialMode = "m
                     maxLength={2000}
                 />
             )}
-            {mode !== "incoming" && (
+            {mode !== "incoming" && mode !== "import" && (
                 <div style={{ marginTop: "12px" }}>
                     <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px" }}>
                         {mode === "call" ? "Call" : "Sent"} <strong>{minutesAgo || "0"}</strong> minute{Number(minutesAgo) === 1 ? "" : "s"} ago (0 = right now)
@@ -1132,6 +1642,35 @@ export default definePlugin({
                     sendBotMessage(ctx.channel.id, { content: `Failed to create fake call: ${String(e)}` });
                 }
             }
+        },
+        {
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            name: "fakeimport",
+            description: "Import the chat data code on your clipboard into this channel as fake messages (client-side only)",
+            execute: async (_opts, ctx) => {
+                try {
+                    const result = importDataCode(ctx.channel.id, await readClipboard());
+                    const left = result.skipped > 0 ? ` (${result.skipped} left out)` : "";
+                    showToast(`Imported ${result.messages.length} message(s) from "${result.name}"${left}`);
+                } catch (e) {
+                    sendBotMessage(ctx.channel.id, { content: `Import failed: ${(e as Error)?.message ?? String(e)}` });
+                }
+            }
+        },
+        {
+            inputType: ApplicationCommandInputType.BUILT_IN,
+            name: "fakeexport",
+            description: "Copy this chat (real and fake messages on screen) as a data code",
+            execute: async (_opts, ctx) => {
+                try {
+                    const { code, count } = exportDataCode(ctx.channel.id);
+                    if (count === 0) return sendBotMessage(ctx.channel.id, { content: "No messages here to copy." });
+                    await copyToClipboard(code);
+                    showToast(`Copied this chat's data code (${count} message(s))`);
+                } catch (e) {
+                    sendBotMessage(ctx.channel.id, { content: `Export failed: ${(e as Error)?.message ?? String(e)}` });
+                }
+            }
         }
     ],
 
@@ -1142,6 +1681,21 @@ export default definePlugin({
     },
 
     start() {
+        onPageError = (e: ErrorEvent) => recordCrash("error", e.error ?? e.message);
+        onPageRejection = (e: PromiseRejectionEvent) => recordCrash("unhandledrejection", e.reason);
+        window.addEventListener("error", onPageError, true);
+        window.addEventListener("unhandledrejection", onPageRejection);
+        // React logs render errors (the kind an error boundary catches, which never
+        // reach the listeners above) through console.error with the Error object.
+        origConsoleError = console.error;
+        console.error = function (this: any, ...args: any[]) {
+            try {
+                const err = args.find(a => a instanceof Error);
+                if (err) recordCrash("console.error", err);
+            } catch { /* ignore */ }
+            return origConsoleError!.apply(this, args);
+        };
+
         loadFakes();
         patchStore();
         // The plugin's own `chatBarButton` slot is the ghost message button;
@@ -1168,6 +1722,9 @@ export default definePlugin({
     },
 
     stop() {
+        if (onPageError) { window.removeEventListener("error", onPageError, true); onPageError = null; }
+        if (onPageRejection) { window.removeEventListener("unhandledrejection", onPageRejection); onPageRejection = null; }
+        if (origConsoleError) { console.error = origConsoleError; origConsoleError = null; }
         removeChatBarButton("FakeMessageCall");
         removeChatBarButton("FakeMessageIncoming");
         unpatchStore();
@@ -1180,5 +1737,7 @@ export default definePlugin({
     injectFakeCall,
     showIncomingCall,
     removeFake,
-    removeFakesForChannel
+    removeFakesForChannel,
+    importDataCode,
+    exportDataCode
 });
